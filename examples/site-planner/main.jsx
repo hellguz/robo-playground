@@ -179,23 +179,15 @@ function App() {
   // One stable store per arm — created on demand, reused across renders so a
   // loaded URDF isn't thrown away when an unrelated bit of state changes.
   const storesRef = useRef(new Map())
-  // Shared "traffic" registry every arm publishes its live chassis footprint
-  // into, so the lib's AnimationController can keep the platforms from colliding
-  // (decentralised stop-and-reroute — see AnimationController.jsx).
-  const trafficRef = useRef(new Map())
-  const simRobots = useMemo(() => arms.map((a, i) => {
+  const simRobots = useMemo(() => arms.map((a) => {
     let store = storesRef.current.get(a.id)
     if (!store) { store = createRobotStore(); storesRef.current.set(a.id, store) }
-    return { id: a.id, store, home: [a.x, 0, a.z], priority: i }
+    return { id: a.id, store, home: [a.x, 0, a.z] }
   }), [arms])
 
   // Push mobile-mode + grid settings into each arm's store as they change.
   useEffect(() => {
     const zoneList = zones.map((z) => ({ minX: z.minX, maxX: z.maxX, minZ: z.minZ, maxZ: z.maxZ }))
-    // Drop traffic entries for arms that no longer exist so they don't linger
-    // as phantom obstacles.
-    const live = new Set(simRobots.map((r) => r.id))
-    for (const id of [...trafficRef.current.keys()]) if (!live.has(id)) trafficRef.current.delete(id)
     for (const r of simRobots) {
       r.store.setState({
         mobileMode: true,
@@ -204,9 +196,6 @@ function App() {
         gridCell: unit,
         gridOrigin,
         zones: zoneList,
-        traffic: trafficRef.current,
-        robotId: r.id,
-        robotPriority: r.priority,
         platformPose: { position: r.home, rotation: [0, 0, 0] },
         homePlatform: { position: r.home, rotation: [0, 0, 0] },
       })

@@ -205,113 +205,6 @@ function resolveZoneCrossings(path, zones, gridMovement, cell = GRID_CELL, origi
   return result
 }
 
-/* ── Robot-to-robot collision avoidance ──────────────────────────────────────
- *
- * Each AGV plans its own grid path (above) knowing only the static restricted
- * zones — it can't see the OTHER roaming arms, so two of them can drive into
- * the same spot.  To stop that without a central controller, every robot
- * publishes its live chassis footprint into a shared `traffic` registry each
- * frame and, before stepping forward, refuses any move that would overlap
- * another robot's footprint.  Because R3F runs the per-robot useFrame callbacks
- * sequentially (and we publish synchronously), each robot sees the most recent
- * positions of the robots ahead of it in the order, so "never step onto an
- * occupied square" is enough to guarantee the chassis rectangles never overlap.
- *
- * Pure stop-and-wait would deadlock head-on standoffs, so when a robot stays
- * blocked too long it reroutes around the offender (treating it as a temporary
- * no-go rectangle, reusing the same zone-avoidance machinery).  A strict
- * priority order decides who yields, so exactly one side of any standoff
- * reroutes while the other holds its line.
- */
-
-// AGV chassis footprint (matches MobilePlatform: 1.10 × 0.80 m) plus a small
-// buffer.  The platform never rotates in these scenes, so an axis-aligned box
-// test is exact and lets robots pass closely on parallel lanes.
-const PLATFORM_HALF_X = 0.55
-const PLATFORM_HALF_Z = 0.40
-const ROBOT_CLEARANCE = 0.18
-// How long a robot tolerates being blocked before it reroutes around whatever
-// is in its way (ms).
-const STANDOFF_MS = 1100
-// Half-size of the temporary no-go square a blocking robot becomes when another
-// reroutes around it.  buildSafePath/BFS additionally inflate it by
-// AGV_CLEARANCE, so the detour clears both chassis half-widths with margin.
-const ROBOT_OBSTACLE_HALF = 0.5
-
-function isTravelState(s) {
-  return s === 'moving_to_start' || s === 'moving_to_end' || s === 'returning'
-}
-
-/* Record this robot's current footprint + intent so the others can avoid it. */
-function publishTraffic(traffic, id, priority, pos, moving) {
-  if (!traffic || id == null) return
-  traffic.set(id, { x: pos[0], z: pos[2], priority, moving })
-}
-
-/* The other robots whose chassis would overlap mine if my platform centre were
- * at `pos` ([x,y,z]).  Axis-aligned box overlap, each rectangle grown by half
- * ROBOT_CLEARANCE so a gap is always kept between them. */
-function findTrafficBlockers(pos, traffic, selfId) {
-  const out = []
-  if (!traffic) return out
-  const spanX = 2 * PLATFORM_HALF_X + ROBOT_CLEARANCE
-  const spanZ = 2 * PLATFORM_HALF_Z + ROBOT_CLEARANCE
-  for (const [id, e] of traffic) {
-    if (id === selfId) continue
-    if (Math.abs(pos[0] - e.x) < spanX && Math.abs(pos[2] - e.z) < spanZ) out.push(e)
-  }
-  return out
-}
-
-/* Restricted zones plus a temporary no-go square for every OTHER robot that is
- * currently parked (grabbing/idle) — used so a new trip routes around robots
- * sitting in the way from the start.  Moving robots are left out (they'll clear
- * on their own; runtime stop-and-reroute handles any residual conflict). */
-function trafficZones(store) {
-  const { traffic, robotId, zones } = store
-  const base = zones || []
-  if (!traffic) return base
-  const extra = []
-  for (const [id, e] of traffic) {
-    if (id === robotId || e.moving) continue
-    extra.push({
-      minX: e.x - ROBOT_OBSTACLE_HALF, maxX: e.x + ROBOT_OBSTACLE_HALF,
-      minZ: e.z - ROBOT_OBSTACLE_HALF, maxZ: e.z + ROBOT_OBSTACLE_HALF,
-    })
-  }
-  return extra.length ? [...base, ...extra] : base
-}
-
-/* Decide whether THIS robot should be the one to reroute around `blockers`:
- *   - always yield to a parked/idle robot (it won't move for us), and
- *   - in a moving-vs-moving standoff, only the lower-priority robot yields
- *     (larger priority number = lower priority), so exactly one side detours. */
-function shouldReroute(blockers, myPriority) {
-  if (blockers.some((b) => !b.moving)) return true
-  return blockers.filter((b) => b.moving).every((b) => myPriority > b.priority)
-}
-
-/* Rebuild the current segment's platform path so it detours around `blockers`,
- * continuing smoothly from where the AGV actually is now (from-pose/angles are
- * reset to the live pose, so neither the chassis nor the arm rewinds). */
-function _rerouteAround(useStore, store, blockers) {
-  const { robotRef, fromPlatform, toPlatform, zones, gridMovement, gridCell, gridOrigin, addLog } = store
-  const curPos = store.platformPose.position
-  const transient = blockers.map((b) => ({
-    minX: b.x - ROBOT_OBSTACLE_HALF, maxX: b.x + ROBOT_OBSTACLE_HALF,
-    minZ: b.z - ROBOT_OBSTACLE_HALF, maxZ: b.z + ROBOT_OBSTACLE_HALF,
-  }))
-  const allZones = [...(zones || []), ...transient]
-  const newPath = buildSafePath(curPos, toPlatform.position, allZones, gridMovement, gridCell, gridOrigin)
-  const curAngles = readAnglesFromRobot(robotRef) || store.fromAngles
-  useStore.setState({
-    fromPlatform: { position: [...curPos], rotation: [...fromPlatform.rotation] },
-    fromAngles: curAngles,
-    platformPath: newPath,
-  })
-  if (addLog) addLog('info', 'Re-routing around another robot…')
-}
-
 function lerpRotation(a, b, t) {
   return [
     a[0] + (b[0] - a[0]) * t,
@@ -461,7 +354,6 @@ export default function AnimationController() {
   const progressRef = useRef(0)
   const prevStateRef = useRef('idle')
   const lastFollowKeyRef = useRef('')
-  const blockedSinceRef = useRef(0)
   const useStore = useRobotStore()
 
   useFrame((_, delta) => {
@@ -471,16 +363,6 @@ export default function AnimationController() {
       followTarget, startObject, endObject, mobileMode,
       platformPose, parkingRef, platformPath,
     } = store
-
-    // Shared traffic registry for robot-to-robot collision avoidance (only set
-    // by scenes that opt in, e.g. the site planner — absent elsewhere, so this
-    // is a no-op for the single-robot demo and the warehouse).
-    const traffic = store.traffic
-    const robotId = store.robotId
-    const robotPriority = store.robotPriority ?? 0
-    // Publish our live footprint every frame, whatever state we're in, so other
-    // robots avoid us even while we're parked grabbing or sitting idle.
-    if (traffic) publishTraffic(traffic, robotId, robotPriority, platformPose.position, isTravelState(animState))
 
     // ── Follow mode: live IK as the user drags the target ──────────────────
     if (animState === 'idle' && followTarget && robotRef) {
@@ -536,7 +418,7 @@ export default function AnimationController() {
         useStore.setState({
           fromAngles: currentAngles, toAngles: homeAngles,
           fromPlatform: currentPlatform, toPlatform: homePlatform,
-          platformPath: buildSafePath(currentPlatform.position, homePlatform.position, trafficZones(store), store.gridMovement, store.gridCell, store.gridOrigin),
+          platformPath: buildSafePath(currentPlatform.position, homePlatform.position, store.zones, store.gridMovement, store.gridCell, store.gridOrigin),
         })
         store.addLog('info', 'Returning to HOME…')
       } else {
@@ -551,39 +433,7 @@ export default function AnimationController() {
 
     // ── Advance segment ────────────────────────────────────────────────────
     const duration = SPEED[animState] || 1.0
-    const platformMoving = mobileMode && fromPlatform && toPlatform
-    const path = platformMoving
-      ? (platformPath && platformPath.length >= 2 ? platformPath : [fromPlatform.position, toPlatform.position])
-      : null
-
-    // Robot-to-robot collision avoidance: peek at where the chassis WOULD be
-    // next and hold position if that overlaps another robot.  If we stay stuck,
-    // reroute around the blocker (see helpers up top).
-    let blocked = false
-    if (traffic && platformMoving && progressRef.current < 1) {
-      const candProgress = Math.min(1, progressRef.current + delta / duration)
-      const cand = poseAlongPath(path, fromPlatform.rotation, toPlatform.rotation, easeInOutCubic(candProgress)).position
-      const blockers = findTrafficBlockers(cand, traffic, robotId)
-      if (blockers.length > 0) {
-        blocked = true
-        const now = performance.now()
-        if (blockedSinceRef.current === 0) blockedSinceRef.current = now
-        if (now - blockedSinceRef.current > STANDOFF_MS && shouldReroute(blockers, robotPriority)) {
-          _rerouteAround(useStore, store, blockers)
-          progressRef.current = 0
-          blockedSinceRef.current = 0
-          // Republish our (unchanged) footprint; resume on the new path next frame.
-          publishTraffic(traffic, robotId, robotPriority, platformPose.position, true)
-          return
-        }
-      } else {
-        blockedSinceRef.current = 0
-      }
-    } else {
-      blockedSinceRef.current = 0
-    }
-
-    if (!blocked) progressRef.current = Math.min(1, progressRef.current + delta / duration)
+    progressRef.current = Math.min(1, progressRef.current + delta / duration)
     const t = easeInOutCubic(progressRef.current)
 
     // Collect this frame's changes into ONE store write.  Three separate
@@ -597,19 +447,16 @@ export default function AnimationController() {
       applyAnglesToRobot(robotRef, interp)
       patch.jointAngles = { ...interp }
     }
-    if (platformMoving) {
+    if (mobileMode && fromPlatform && toPlatform) {
+      const path = platformPath && platformPath.length >= 2
+        ? platformPath
+        : [fromPlatform.position, toPlatform.position]
       patch.platformPose = poseAlongPath(path, fromPlatform.rotation, toPlatform.rotation, t)
     }
 
     useStore.setState(patch)
 
-    // Publish the footprint we actually moved to this frame, so robots later in
-    // the frame's update order avoid our new position rather than the old one.
-    if (traffic && patch.platformPose) {
-      publishTraffic(traffic, robotId, robotPriority, patch.platformPose.position, isTravelState(animState))
-    }
-
-    if (!blocked && progressRef.current >= 1) {
+    if (progressRef.current >= 1) {
       _onSegmentComplete(useStore, store, animState)
     }
   })
@@ -658,7 +505,7 @@ function _solveSegment(useStore, store, target, currentAngles, currentPlatform) 
     useStore.setState({
       fromAngles: currentAngles, toAngles: clamped,
       fromPlatform: currentPlatform, toPlatform: targetPlatform,
-      platformPath: buildSafePath(currentPlatform.position, targetPlatform.position, trafficZones(store), store.gridMovement, store.gridCell, store.gridOrigin),
+      platformPath: buildSafePath(currentPlatform.position, targetPlatform.position, store.zones, store.gridMovement, store.gridCell, store.gridOrigin),
     })
   } else {
     addLog('warn', `IK did not converge for ${target} — target may be out of reach`)
